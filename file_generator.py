@@ -2,23 +2,21 @@ import numpy as np
 from pathlib import Path
 
 # --- Configuration ---
-FS             = 1000          # Sampling frequency in Hz (change here later)
-N_SAMPLES      = 2048          # Samples per signal
-F_START        = 21            # LFM start frequency in Hz (scaled to FS)
-F_END          = 23            # LFM end frequency in Hz (scaled to FS)
-N_SIGNALS      = 100           # Number of signal pairs to generate
-SEED           = 42
+FS              = 1000          # Sampling frequency in Hz (change here later)
+N_SAMPLES       = 2048          # Samples per signal
+F_START         = 21            # LFM start frequency in Hz (scaled to FS)
+F_END           = 23            # LFM end frequency in Hz (scaled to FS)
+SEED            = 42
 
-# Power range for clean signals (dB)
-CLEAN_PWR_MIN  = -40.0
-CLEAN_PWR_MAX  =   6.0
+# Power sweep range (dB) — clean and noise both drawn from this set
+PWR_MAX         =   6.0
+PWR_MIN         = -40.0
+PWR_STEP        =   0.5
 
-# Power range for noise (dB) — change these two lines if needed later
-NOISE_PWR_MIN  = -40.0
-NOISE_PWR_MAX  =   6.0
+REPEATS_PER_LVL = 22            # repetitions per power level (93 levels x 22 = 2046 pairs)
 
-CLEAN_DIR      = Path("data/clean")
-NOISY_DIR      = Path("data/noisy")
+CLEAN_DIR      = Path(r"C:\Users\HARSHA\Desktop\dataset\clean")
+NOISY_DIR      = Path(r"C:\Users\HARSHA\Desktop\dataset\noisy")
 
 # --- Helpers ---
 def db_to_linear(db):
@@ -34,19 +32,15 @@ def scale_to_power(signal, target_power_db):
 
 def generate_lfm(n_samples, fs, f_start, f_end):
     """Generate a single LFM (chirp) signal."""
-    t      = np.linspace(0, n_samples / fs, n_samples, endpoint=False)
-    # Apply Tukey window for gradual rise and fall
-    window = np.zeros(n_samples)
-    alpha  = 0.2  # taper ratio — 10% rise, 10% fall
     from scipy.signal import windows
-    window = windows.tukey(n_samples, alpha=alpha)
+    t      = np.linspace(0, n_samples / fs, n_samples, endpoint=False)
+    window = windows.tukey(n_samples, alpha=0.2)  # gradual rise and fall
     chirp  = np.sin(2 * np.pi * (f_start * t + (f_end - f_start) / (2 * (n_samples / fs)) * t ** 2))
     return chirp * window
 
 def generate_awgn(n_samples):
     """Generate unit-power AWGN."""
-    noise = np.random.randn(n_samples)
-    return noise
+    return np.random.randn(n_samples)
 
 # def generate_colored_noise(n_samples, fs, color='pink'):
 #     """Generate colored noise (pink/brown/blue).
@@ -77,31 +71,47 @@ def main():
     CLEAN_DIR.mkdir(parents=True, exist_ok=True)
     NOISY_DIR.mkdir(parents=True, exist_ok=True)
 
-    for i in range(1, N_SIGNALS + 1):
-        # Generate clean LFM
-        chirp = generate_lfm(N_SAMPLES, FS, F_START, F_END)
+    # Deterministic descending power sequence: 6, 5.5, ..., -40
+    power_levels = np.arange(PWR_MAX, PWR_MIN - PWR_STEP, -PWR_STEP)
+    n_levels     = len(power_levels)
 
-        # Scale clean signal to random power in [CLEAN_PWR_MIN, CLEAN_PWR_MAX]
-        clean_pwr_db = np.random.uniform(CLEAN_PWR_MIN, CLEAN_PWR_MAX)
+    # Build clean-power sequence: each level repeated REPEATS_PER_LVL times, in descending order
+    clean_powers = np.repeat(power_levels, REPEATS_PER_LVL)
+    n_signals    = len(clean_powers)
+
+    # Noise power: same multiset of values, independently shuffled
+    noise_powers = clean_powers.copy()
+    np.random.shuffle(noise_powers)
+
+    print(f"Power levels: {n_levels} | Repeats per level: {REPEATS_PER_LVL} | "
+          f"Total pairs: {n_signals}\n")
+
+    for i in range(1, n_signals + 1):
+        idx = i - 1
+
+        # Generate clean LFM, scale to its deterministic power
+        chirp        = generate_lfm(N_SAMPLES, FS, F_START, F_END)
+        clean_pwr_db = clean_powers[idx]
         clean        = scale_to_power(chirp, clean_pwr_db)
 
-        # Generate AWGN and scale to random power in [NOISE_PWR_MIN, NOISE_PWR_MAX]
-        noise_pwr_db = np.random.uniform(NOISE_PWR_MIN, NOISE_PWR_MAX)
+        # Generate AWGN, scale to its shuffled power
+        noise_pwr_db = noise_powers[idx]
         noise        = generate_awgn(N_SAMPLES)
         noise        = scale_to_power(noise, noise_pwr_db)
 
-        # Noisy = clean + noise (same clean signal, paired)
+        # Noisy = clean + noise
         noisy = clean + noise
 
         # Save as .dat files
         np.savetxt(CLEAN_DIR / f"{i}.dat", clean)
         np.savetxt(NOISY_DIR / f"{i}.dat", noisy)
 
-        print(f"Signal {i:03d} | Clean power: {clean_pwr_db:.2f} dB | "
-              f"Noise power: {noise_pwr_db:.2f} dB | "
-              f"SNR: {clean_pwr_db - noise_pwr_db:.2f} dB")
+        if i % 100 == 0 or i == n_signals:
+            print(f"Signal {i:04d}/{n_signals} | Clean power: {clean_pwr_db:6.2f} dB | "
+                  f"Noise power: {noise_pwr_db:6.2f} dB | "
+                  f"SNR: {clean_pwr_db - noise_pwr_db:6.2f} dB")
 
-    print(f"\nDone. {N_SIGNALS} pairs saved to {CLEAN_DIR} and {NOISY_DIR}")
+    print(f"\nDone. {n_signals} pairs saved to {CLEAN_DIR} and {NOISY_DIR}")
 
 if __name__ == "__main__":
     main()
