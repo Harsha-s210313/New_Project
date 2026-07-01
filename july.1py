@@ -1,0 +1,209 @@
+import os
+import sys
+import random
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from scipy.stats import pearsonr
+import matplotlib.pyplot as plt
+
+# --- Constants ---
+SIGNAL_LENGTH   = 2048
+BATCH_SIZE      = 9
+EPOCHS          = 50
+LEARNING_RATE   = 1e-3
+TRAIN_RATIO     = 0.8
+VALID_RATIO     = 0.1
+TEST_RATIO      = 0.1
+PATIENCE        = 10
+SEED            = 42
+RESULTS_DIR     = "Results"
+MODEL_SAVE_PATH = "best_model.pth"
+
+
+CLEAN_FOLDER      = Path(r"C:\Users\HARSHA\Desktop\dataset\clean")
+NOISY_FOLDER      = Path(r"C:\Users\HARSHA\Desktop\dataset\noisy")
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- Dataset ---
+class AcousticDataset(Dataset):
+    def __init__(self, clean_folder, noisy_folder):
+        self.clean_files = sorted(clean_folder.glob("*.dat"))
+        self.noisy_files = sorted(noisy_folder.glob("*.dat"))
+
+    def __len__(self):
+        return len(self.clean_files)
+
+    def __getitem__(self, idx):
+        clean = np.loadtxt(self.clean_files[idx], dtype=np.float32)
+        noisy = np.loadtxt(self.noisy_files[idx], dtype=np.float32)
+        clean = clean[:SIGNAL_LENGTH]
+        noisy = noisy[:SIGNAL_LENGTH]
+        clean = torch.tensor(clean, dtype=torch.float32).unsqueeze(0)
+        noisy = torch.tensor(noisy, dtype=torch.float32).unsqueeze(0)
+        return noisy, clean
+
+# --- DoubleConv Block ---
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(),
+            nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+# --- UNet1D (doubled channel capacity) ---
+class UNet1D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Encoder
+        self.e1 = DoubleConv(1, 32)
+        self.e2 = DoubleConv(32, 64)
+        self.e3 = DoubleConv(64, 128)
+        self.p1 = nn.MaxPool1d(2)
+        self.p2 = nn.MaxPool1d(2)
+        self.p3 = nn.MaxPool1d(2)
+        # Bottleneck
+        self.b  = DoubleConv(128, 256)
+        # Decoder
+        self.u3 = nn.ConvTranspose1d(256, 128, 2, 2)
+        self.d3 = DoubleConv(256, 128)
+        self.u2 = nn.ConvTranspose1d(128, 64, 2, 2)
+        self.d2 = DoubleConv(128, 64)
+        self.u1 = nn.ConvTranspose1d(64, 32, 2, 2)
+        self.d1 = DoubleConv(64, 32)
+        self.out = nn.Conv1d(32, 1, 1)
+
+    def forward(self, x):
+        e1 = self.e1(x)
+        e2 = self.e2(self.p1(e1))
+        e3 = self.e3(self.p2(e2))
+        b  = self.b(self.p3(e3))
+        d3 = self.u3(b)
+        d3 = self.d3(torch.cat([d3, e3], 1))
+        d2 = self.u2(d3)
+        d2 = self.d2(torch.cat([d2, e2], 1))
+        d1 = self.u1(d2)
+        d1 = self.d1(torch.cat([d1, e1], 1))
+        return self.out(d1)
+
+# --- Metrics ---
+def snr(clean, pred):
+    noise = clean - pred
+    return 10 * np.log10(np.sum(clean**2) / (np.sum(noise**2) + 1e-8))
+
+def pcc(clean, pred):
+    return pearsonr(clean.flatten(), pred.flatten())[0]
+
+# --- Training ---
+def run_epoch(model, loader, optimizer=None):
+    model.train() if optimizer else model.eval()
+    loss_fn    = nn.MSELoss()
+    total_loss = 0
+    for noisy, clean in loader:
+        noisy = noisy.to(DEVICE)
+        clean = clean.to(DEVICE)
+        pred  = model(noisy)
+        loss  = loss_fn(pred, clean)
+        if optimizer:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
+# --- Main ---
+def main():
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    dataset = AcousticDataset(Path(CLEAN_FOLDER), Path(NOISY_FOLDER))
+    n       = len(dataset)
+    n_train = int(TRAIN_RATIO * n)
+    n_val   = int(VALID_RATIO * n)
+    n_test  = n - n_train - n_val
+
+    train_set, val_set, test_set = torch.utils.data.random_split(
+        dataset,
+        [n_train, n_val, n_test],
+        generator=torch.Generator().manual_seed(SEED)
+    )
+
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader   = DataLoader(val_set,   batch_size=BATCH_SIZE, shuffle=False)
+    test_loader  = DataLoader(test_set,  batch_size=1,          shuffle=False)
+
+    model     = UNet1D().to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3)
+
+    best             = float("inf")
+    patience_counter = 0
+    train_hist, val_hist = [], []
+
+    for epoch in range(EPOCHS):
+        train_loss = run_epoch(model, train_loader, optimizer)
+        val_loss   = run_epoch(model, val_loader)
+        scheduler.step(val_loss)
+        train_hist.append(train_loss)
+        val_hist.append(val_loss)
+        print(f"Epoch {epoch+1}/{EPOCHS} | Train {train_loss:.4f} | Val {val_loss:.4f}")
+
+        if val_loss < best:
+            best             = val_loss
+            torch.save(model.state_dict(), MODEL_SAVE_PATH)
+            patience_counter = 0
+            print("Saved best model!")
+        else:
+            patience_counter += 1
+            if patience_counter >= PATIENCE:
+                print("Early Stopping triggered!")
+                break
+
+    model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=DEVICE))
+    model.eval()
+
+    N_PLOTS = 10
+    plot_indices = set(random.sample(range(len(test_set)), min(N_PLOTS, len(test_set))))
+
+    snr_in_list, snr_out_list, pcc_list = [], [], []
+    with torch.no_grad():
+        for i, (noisy, clean) in enumerate(test_loader):
+            noisy_np = noisy.numpy().squeeze()
+            clean_np = clean.numpy().squeeze()
+            pred     = model(noisy.to(DEVICE)).cpu().numpy().squeeze()
+
+            snr_in_list.append(snr(clean_np, noisy_np))
+            snr_out_list.append(snr(clean_np, pred))
+            pcc_list.append(pcc(clean_np, pred))
+
+            if i in plot_indices:
+                plt.figure(figsize=(12, 4))
+                plt.plot(noisy_np, label="Noisy",    alpha=0.7)
+                plt.plot(clean_np, label="Clean",    alpha=0.7)
+                plt.plot(pred,     label="Denoised", alpha=0.9)
+                plt.legend()
+                plt.title(f"Test Signal {i+1} | SNR_in: {snr_in_list[-1]:.2f} dB | "
+                          f"SNR_out: {snr_out_list[-1]:.2f} dB | PCC: {pcc_list[-1]:.4f}")
+                plt.grid()
+                plt.tight_layout()
+                plt.savefig(os.path.join(RESULTS_DIR, f"test_signal_{i+1}.png"))
+                plt.show()
+
+                
+    print(f"\nAvg SNR_in  : {np.mean(snr_in_list):.2f} dB")
+    print(f"Avg SNR_out : {np.mean(snr_out_list):.2f} dB")
+    print(f"Avg PCC     : {np.mean(pcc_list):.4f}")
+
+if __name__ == "__main__":
+    main()
